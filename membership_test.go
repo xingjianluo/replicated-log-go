@@ -16,11 +16,11 @@ func TestAddNodeThenCommit(t *testing.T) {
 	if err := c.AddNode("n4"); err != nil {
 		t.Fatal(err)
 	}
-	cfgIdx, r := c.ProposeConfChange("cl", ConfChange{Op: ConfAddVoter, Node: "n4"})
-	if r != ReasonOK {
+	if _, r := c.ProposeConfChange("cl", ConfChange{Op: ConfAddVoter, Node: "n4"}); r != ReasonOK {
 		t.Fatalf("成员变更被拒: %s", r)
 	}
-	if err := c.WaitCommit(cfgIdx, 300); err != nil {
+	// 联合共识两阶段：等待成员表最终落定到 4 节点，而不只是 enter-joint 提交。
+	if err := c.WaitMembership([]NodeID{"n1", "n2", "n3", "n4"}, 300); err != nil {
 		t.Fatal(err)
 	}
 	c.RunUntil(20)
@@ -49,11 +49,10 @@ func TestRemoveNodeThenCommit(t *testing.T) {
 	if err := c.WaitCommit(idx, 200); err != nil {
 		t.Fatal(err)
 	}
-	cfgIdx, r := c.ProposeConfChange("cl", ConfChange{Op: ConfRemoveVoter, Node: "n5"})
-	if r != ReasonOK {
+	if _, r := c.ProposeConfChange("cl", ConfChange{Op: ConfRemoveVoter, Node: "n5"}); r != ReasonOK {
 		t.Fatalf("移除成员被拒: %s", r)
 	}
-	if err := c.WaitCommit(cfgIdx, 300); err != nil {
+	if err := c.WaitMembership([]NodeID{"n1", "n2", "n3", "n4"}, 300); err != nil {
 		t.Fatal(err)
 	}
 	// n5 标记为 removed，不再处理协议消息；从编排移除。

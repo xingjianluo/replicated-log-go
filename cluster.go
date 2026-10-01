@@ -88,11 +88,25 @@ func NewCluster(ids []NodeID, opts ...ClusterOption) *Cluster {
 		fsm := NewKVState()
 		n := NewNode(id, members, st, fsm, c.log, c.seed*1000+c.nodeSeedCounter)
 		n.SetEmitter(func(m OutMsg) { c.collectAck(m) })
+		c.bindReachable(n)
 		c.nodes[id] = n
 		c.stores[id] = st
 		c.fsms[id] = fsm
 	}
 	return c
+}
+
+// bindReachable 注入“存活且未被网络隔离”判定，供节点在联合阶段
+// 计算可表态成员多数派（活性）使用。
+func (c *Cluster) bindReachable(n *Node) {
+	id := n.ID()
+	n.SetReachable(func(peer NodeID) bool {
+		p, ok := c.nodes[peer]
+		if !ok || !p.Alive() || p.removed {
+			return false
+		}
+		return !c.net.partitioned[peer] && !c.net.partitioned[id]
+	})
 }
 
 func (c *Cluster) collectAck(m OutMsg) {
@@ -175,7 +189,7 @@ func (c *Cluster) Propose(client NodeID, payload []byte) (int, Reason) {
 	return ack.Index, ReasonOK
 }
 
-// ProposeConfChange 提交成员变更。
+// ProposeConfChange 提交单节点成员变更（向后兼容的便捷接口，内部走联合共识）。
 func (c *Cluster) ProposeConfChange(client NodeID, cc ConfChange) (int, Reason) {
 	l := c.Leader()
 	if l == "" {
@@ -186,6 +200,59 @@ func (c *Cluster) ProposeConfChange(client NodeID, cc ConfChange) (int, Reason) 
 		return 0, ack.Reason
 	}
 	return ack.Index, ReasonOK
+}
+
+// ProposeConfChangeBatch 一次提交批量成员变更（同时增/删多个节点）。
+// 返回的索引是 enter-joint 条目的索引；整批变更最终落定请用 WaitMembership 等待。
+func (c *Cluster) ProposeConfChangeBatch(client NodeID, add, remove []NodeID) (int, Reason) {
+	l := c.Leader()
+	if l == "" {
+		return 0, ReasonNoQuorum
+	}
+	ack := c.nodes[l].ProposeConfChangeBatch(client, ConfChange{
+		Op:     ConfBatchVoters,
+		Add:    append([]NodeID(nil), add...),
+		Remove: append([]NodeID(nil), remove...),
+	})
+	if !ack.Success {
+		return 0, ack.Reason
+	}
+	return ack.Index, ReasonOK
+}
+
+// WaitMembership 推进直到所有在线、未隔离且仍属于集群的成员都离开联合阶段、
+// 没有待生效变更，且生效成员表与 want 完全一致（顺序无关）；超时返回错误。
+// 用于等待一批成员变更“最终落定”，而不仅是 enter-joint 条目提交。
+func (c *Cluster) WaitMembership(want []NodeID, maxTicks int) error {
+	wantSet := NewMembership(want...)
+	for i := 0; i < maxTicks; i++ {
+		if c.membershipSettled(wantSet) {
+			return nil
+		}
+		c.Step()
+	}
+	return fmt.Errorf("等待成员表收敛到 %v 超时（%d ticks）", want, maxTicks)
+}
+
+func (c *Cluster) membershipSettled(want Membership) bool {
+	ok := false
+	for _, n := range c.nodes {
+		if !n.Alive() || n.removed || c.net.partitioned[n.id] {
+			continue
+		}
+		// 生效配置已不含自己的节点（刚提交完移除自己）不纳入收敛判定。
+		if !n.membership.IsJoint() && n.membership.Size() > 0 && !n.membership.Contains(n.id) {
+			continue
+		}
+		if n.membership.IsJoint() || n.pendingConf {
+			return false
+		}
+		if !n.membership.Equal(want) {
+			return false
+		}
+		ok = true
+	}
+	return ok
 }
 
 // Step 推进一个确定性时间单位：节点计时 -> 网络投递 -> 处理应答。
@@ -299,6 +366,7 @@ func (c *Cluster) StartNode(id NodeID) error {
 	c.nodeSeedCounter++
 	repl := NewNode(id, n.membership, c.stores[id], c.fsms[id], c.log, c.seed*2000+c.nodeSeedCounter)
 	repl.SetEmitter(func(m OutMsg) { c.collectAck(m) })
+	c.bindReachable(repl)
 	repl.Start()
 	c.nodes[id] = repl
 	return nil
@@ -316,6 +384,7 @@ func (c *Cluster) AddNode(id NodeID) error {
 	// 新节点空日志加入，不写本地引导配置，完全由领导者补齐。
 	n := NewJoinNode(id, st, fsm, c.log, c.seed*3000+c.nodeSeedCounter)
 	n.SetEmitter(func(m OutMsg) { c.collectAck(m) })
+	c.bindReachable(n)
 	n.Start()
 	c.nodes[id] = n
 	c.stores[id] = st
@@ -359,6 +428,8 @@ func (c *Cluster) State(id NodeID) NodeView {
 		LastIndex:   n.st.LastIndex(),
 		Alive:       n.Alive(),
 		Members:     n.Membership().List(),
+		Joint:       n.Membership().IsJoint(),
+		Pending:     n.PendingConf(),
 	}
 }
 
@@ -373,6 +444,10 @@ type NodeView struct {
 	LastIndex   int
 	Alive       bool
 	Members     []NodeID
+	// Joint 为 true 表示该节点当前生效的是联合配置 C_old,new。
+	Joint bool
+	// Pending 为 true 表示存在未提交配置条目或 leave-joint 尚未追加。
+	Pending bool
 }
 
 // Ticks 返回已推进的时间单位数。

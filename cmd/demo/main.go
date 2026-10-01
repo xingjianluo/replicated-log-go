@@ -84,17 +84,27 @@ func main() {
 	fmt.Printf(">>> n5 经快照恢复 commit=%d applied=%d\n",
 		c.State("n5").CommitIndex, c.State("n5").LastApplied)
 
-	fmt.Println("================ 场景 6：成员扩容到 6 节点 ================")
+	fmt.Println("================ 场景 6：批量成员变更（一次加两台，联合共识两阶段） ================")
 	must(c.AddNode("n6"))
-	cfgIdx, r := c.ProposeConfChange("demo-client", raft.ConfChange{Op: raft.ConfAddVoter, Node: "n6"})
+	must(c.AddNode("n7"))
+	// 一次打包加入两台机器，内部走 enter-joint(C_5,7) -> leave-joint(C_7) 两阶段。
+	cfgIdx, r := c.ProposeConfChangeBatch("demo-client",
+		[]raft.NodeID{"n6", "n7"}, nil)
 	mustR(r)
-	must(c.WaitCommit(cfgIdx, 300))
-	c.RunUntil(10)
-	idx, r = c.Propose("demo-client", []byte("SET zeta=6"))
+	fmt.Printf(">>> 已落盘 enter-joint index=%d，期间普通日志不停摆\n", cfgIdx)
+	// 变更进行中照样提交一条普通命令，验证服务不中断。
+	midIdx, r := c.Propose("demo-client", []byte("SET eta=7"))
+	mustR(r)
+	must(c.WaitCommit(midIdx, 300))
+	fmt.Printf(">>> 变更进行中普通命令已提交 index=%d\n", midIdx)
+	// 等待整批变更最终落定（离开联合阶段，成员表收敛到 7 节点）。
+	must(c.WaitMembership([]raft.NodeID{"n1", "n2", "n3", "n4", "n5", "n6", "n7"}, 400))
+	fmt.Println(">>> leave-joint 已提交，全部存活节点成员表收敛为 7 节点（多数派阈值 4）")
+	idx, r = c.Propose("demo-client", []byte("SET theta=8"))
 	mustR(r)
 	must(c.WaitCommit(idx, 200))
-	fmt.Printf(">>> 扩容后成员=%v（多数派阈值 4），全部命令一致：\n", c.State("n6").Members)
-	for _, id := range []raft.NodeID{"n1", "n2", "n3", "n4", "n5", "n6"} {
+	fmt.Printf(">>> 扩容后按 7 节点多数派继续提交 index=%d，全部命令一致：\n", idx)
+	for _, id := range []raft.NodeID{"n1", "n2", "n3", "n4", "n5", "n6", "n7"} {
 		fmt.Printf("    %s: %v\n", id, c.Commands(id))
 	}
 

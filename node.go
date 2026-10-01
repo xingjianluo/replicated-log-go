@@ -49,12 +49,14 @@ type Node struct {
 	electionTimeout  int
 	heartbeatElapsed int
 
-	// 当前生效配置
+	// 当前生效配置（联合共识期间为 C_old,new 双集合）
 	membership Membership
-	// prevMembership 为“未提交成员变更”之前的旧配置；
-	// 变更条目提交前，领导者需向旧∪新并集复制，确保被移除者也能收到移除条目。
+	// prevMembership 仅在“最后一条配置条目尚未提交”时使用：
+	// 保存该条目生效之前的配置，复制目标取两者并集——
+	// enter-joint 未落盘/未提交时它是 C_old，leave-joint 未提交时它是 C_old,new，
+	// 保证被移除者也能收到“移除自己”的条目与携带提交点的最后心跳。
 	prevMembership Membership
-	// 上一次成员变更尚未提交时为 true
+	// 成员变更尚在进行：存在未提交配置条目，或联合配置已生效但 leave-joint 尚未追加。
 	pendingConf bool
 	// 本节点已被成员变更移除
 	removed bool
@@ -63,16 +65,35 @@ type Node struct {
 	nextIndex  map[NodeID]int
 	matchIndex map[NodeID]int
 	votes      map[NodeID]bool
+	// preVotes 为 pre-vote 阶段的预投票计票；preVoting 标记当前处于预投票。
+	preVotes  map[NodeID]bool
+	preVoting bool
 
 	// 待复制提案队列（领导者）：propose 已落盘，等待提交后回调
 	pending []pendingProposal
 
 	// emit 由 Cluster 注入，用于异步客户端应答（不经过 RPC 通道）。
 	emit func(OutMsg)
+
+	// reachable 由 Cluster 注入，判断某成员当前是否存活且未被网络隔离。
+	// 仅用于联合阶段选举的活性判定：确认不可达（停止/隔离）的成员无法再对
+	// 投票表态，不应让其永久占用多数派席位而锁死集群（Ongaro 论文 §6.3）。
+	// 缺省（nil）时一律视为可达，退化为最保守的多数派定义。
+	reachable func(NodeID) bool
 }
 
 // SetEmitter 注入客户端应答输出回调。
 func (n *Node) SetEmitter(f func(OutMsg)) { n.emit = f }
+
+// SetReachable 注入成员可达性判定（联合阶段选举活性用）。
+func (n *Node) SetReachable(f func(NodeID) bool) { n.reachable = f }
+
+func (n *Node) canReach(id NodeID) bool {
+	if n.reachable == nil {
+		return true
+	}
+	return n.reachable(id)
+}
 
 type pendingProposal struct {
 	index int
@@ -105,6 +126,7 @@ func newNode(id NodeID, initial Membership, st *Storage, fsm FSM, log *Logger, s
 		nextIndex:  map[NodeID]int{},
 		matchIndex: map[NodeID]int{},
 		votes:      map[NodeID]bool{},
+		preVotes:   map[NodeID]bool{},
 		membership: initial,
 	}
 	n.resetElectionTimeout()
@@ -151,24 +173,57 @@ func newNode(id NodeID, initial Membership, st *Storage, fsm FSM, log *Logger, s
 }
 
 // rebuildMembership 从快照配置出发重放全部配置条目，重建当前配置与 pendingConf。
+// 用于节点重启：联合共识的 enter/leave 两阶段条目都会被完整重放。
 func (n *Node) rebuildMembership() {
-	m := n.membership
+	n.reconcileMembership()
+}
+
+// confBase 返回配置重放的起点：存在快照时为快照点配置，
+// 否则从空配置开始（index=1 的引导 ConfSetVoters 条目会完成首次建立）。
+func (n *Node) confBase() Membership {
 	if n.st.HasSnapshot() {
-		m = n.st.SnapshotCopy().Membership
+		return n.st.SnapshotCopy().Membership
 	}
-	lastConfIndex := 0
+	return NewMembership()
+}
+
+// membershipAt 重放到 throughIndex（含）为止的配置条目，返回该位置的生效配置。
+func (n *Node) membershipAt(through int) Membership {
+	m := n.confBase()
 	for _, e := range n.st.AllEntries() {
+		if e.Index > through {
+			break
+		}
 		if e.Kind == KindConfChange {
 			if cc, err := decodeConfChange(e.Payload); err == nil {
 				m = m.Apply(cc)
-				lastConfIndex = e.Index
 			}
 		}
 	}
-	n.membership = m
-	n.pendingConf = lastConfIndex > n.commitIndex
-	if !m.Contains(n.id) && lastConfIndex > 0 {
-		n.removed = true
+	return m
+}
+
+// lastConfIndex 返回现存日志（快照之后）最后一条配置条目的索引，没有则返回 0。
+func (n *Node) lastConfIndex() int {
+	last := 0
+	for _, e := range n.st.AllEntries() {
+		if e.Kind == KindConfChange {
+			last = e.Index
+		}
+	}
+	return last
+}
+
+// reconcileMembership 以快照+日志为唯一事实来源重建当前生效配置、pendingConf
+// 与“上一条配置生效前”的 prevMembership。任何时刻调用都是幂等的，
+// 不再依赖增量重放，避免条目截断后配置视图残留。
+func (n *Node) reconcileMembership() {
+	last := n.lastConfIndex()
+	n.membership = n.membershipAt(n.st.LastIndex())
+	n.pendingConf = n.membership.IsJoint() || last > n.commitIndex
+	n.prevMembership = Membership{}
+	if last > n.commitIndex {
+		n.prevMembership = n.membershipAt(last - 1)
 	}
 }
 
@@ -192,6 +247,12 @@ func (n *Node) Leader() NodeID { return n.leader }
 
 // Membership 返回当前生效配置的副本。
 func (n *Node) Membership() Membership { return n.membership }
+
+// PendingConf 报告是否仍有成员变更未最终落定。
+func (n *Node) PendingConf() bool { return n.pendingConf }
+
+// IsJoint 报告当前是否处于联合配置阶段。
+func (n *Node) IsJoint() bool { return n.membership.IsJoint() }
 
 // Alive 返回节点是否在线。
 func (n *Node) Alive() bool { return n.alive }
@@ -219,9 +280,40 @@ func (n *Node) becomeFollower(term int, leader NodeID) {
 	n.role = Follower
 	n.leader = leader
 	n.votes = map[NodeID]bool{}
+	n.preVotes = map[NodeID]bool{}
+	n.preVoting = false
 	n.resetElectionTimeout()
 	n.log.Infof(string(n.id), term, n.quorum(), n.commitIndex, ReasonOK,
 		"角色转为 follower 认可领导者=%s", leader)
+}
+
+// startPreVote 发起一轮预投票：任期号用 currentTerm+1 但不持久化、不自投，
+// 接收方也只做“日志新旧 + 是否已有权威领导者”的判断而不记录投票。
+// 预投票凑齐多数派后才真正 becomeCandidate，避免陈旧节点用真实高任期打断在任领导者。
+func (n *Node) startPreVote() []OutMsg {
+	term := n.st.CurrentTerm() + 1
+	n.preVoting = true
+	n.preVotes = map[NodeID]bool{}
+	n.leader = "" // 已判定现任领导者失联，清掉残留标记以免压制同任期竞选者
+	lastTerm, _ := n.st.TermAt(n.st.LastIndex())
+	rv := RequestVote{
+		From:         n.id,
+		Term:         term,
+		LastLogIndex: n.st.LastIndex(),
+		LastLogTerm:  lastTerm,
+		PreVote:      true,
+	}
+	var out []OutMsg
+	for _, peer := range n.membership.List() {
+		if peer == n.id {
+			continue
+		}
+		out = append(out, OutMsg{To: peer, RPC: &rv})
+	}
+	n.log.Infof(string(n.id), n.st.CurrentTerm(), n.quorum(), n.commitIndex, ReasonOK,
+		"发起预投票 探测任期=%d lastIndex=%d lastTerm=%d 成员=%d",
+		term, rv.LastLogIndex, rv.LastLogTerm, n.membership.Size())
+	return out
 }
 
 func (n *Node) becomeCandidate() []OutMsg {
@@ -256,17 +348,40 @@ func (n *Node) becomeLeader() []OutMsg {
 	term := n.st.CurrentTerm()
 	n.role = Leader
 	n.leader = n.id
-	n.prevMembership = n.membership
+	n.prevMembership = Membership{}
+	// 从持久日志/快照重建配置状态：若接管了一个已提交 enter-joint、
+	// 但 leave-joint 尚未追加的变更，新领导者要负责把变更推到完成。
+	n.reconcileMembership()
+	// 复制进度对旧∪新并集全部成员初始化，避免漏发新增节点。
+	inited := map[NodeID]bool{n.id: true}
 	for _, peer := range n.membership.List() {
 		n.nextIndex[peer] = n.st.LastIndex() + 1
 		n.matchIndex[peer] = 0
+		inited[peer] = true
+	}
+	for _, peer := range n.prevMembership.List() {
+		if !inited[peer] {
+			n.nextIndex[peer] = n.st.LastIndex() + 1
+			n.matchIndex[peer] = 0
+			inited[peer] = true
+		}
 	}
 	n.matchIndex[n.id] = n.st.LastIndex()
 	n.heartbeatElapsed = 0
+	// 写入当前任期的 no-op 条目锚定提交点（图 8 安全性）：
+	// 它随多数派复制提交后，前一任期遗留条目（可能含 enter-joint）一并被提交，
+	// 保证新领导者能把接管到的未完成成员变更尽快、确定地推到完成。
+	noopIdx := n.st.AppendNew(term, LogEntry{Kind: KindNoop, Payload: nil})
+	n.matchIndex[n.id] = noopIdx
 	n.log.Infof(string(n.id), term, n.quorum(), n.commitIndex, ReasonOK,
-		"获得多数派，成为领导者 成员数=%d 多数派=%d", n.membership.Size(), n.quorum())
-	// 立即广播一次心跳以宣告权威。
-	return n.broadcastAppend()
+		"获得多数派，成为领导者 成员数=%d 多数派=%d joint=%v noopIndex=%d",
+		n.membership.Size(), n.quorum(), n.membership.IsJoint(), noopIdx)
+	var out []OutMsg
+	// 接管未完成的联合变更：必要时自动追加 leave-joint 条目。
+	out = append(out, n.maybeCompleteJointChange()...)
+	// 立即广播一次心跳/no-op 以宣告权威。
+	out = append(out, n.broadcastAppend()...)
+	return out
 }
 
 // Start 将节点标记为在线（初始启动或重启）。
@@ -386,13 +501,26 @@ func (n *Node) Tick() []OutMsg {
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= heartbeatTicks {
 			n.heartbeatElapsed = 0
+			// 幂等地推进未完成的联合变更（enter 已提交则补追加 leave-joint）。
+			out = append(out, n.maybeCompleteJointChange()...)
 			out = append(out, n.broadcastAppend()...)
 		}
 	default:
+		// 尚未进入任何成员表的空日志追赶节点不得发起选举：
+		// 它在被加入配置前既没有投票权也没有日志，参选只会制造噪声，绝不可能赢。
+		if n.membership.Size() == 0 && n.st.LastIndex() == 0 {
+			break
+		}
 		n.electionElapsed++
+		// 所认可的领导者已被成员变更移除（离开当前成员表）时，
+		// 立即发起预投票补选，而不必傻等整个选举超时。
+		if n.leader != "" && n.leader != n.id && !n.membership.Contains(n.leader) {
+			n.electionElapsed = n.electionTimeout
+		}
 		if n.electionElapsed >= n.electionTimeout {
 			n.electionElapsed = 0
-			out = append(out, n.becomeCandidate()...)
+			// 先发 pre-vote 探测（不增任期、不投自己），赢得预投票才真正选举。
+			out = append(out, n.startPreVote()...)
 		}
 	}
 	return out
@@ -427,10 +555,32 @@ func (n *Node) Propose(client NodeID, payload []byte) ClientAck {
 	return ClientAck{To: client, Term: n.Term(), Index: idx, Success: true, Reason: ReasonOK}
 }
 
-// ProposeConfChange 提交单节点成员变更（增/删投票成员）。
-// 规则：一次只允许一个未提交的变更；不允许把集群降到没有多数派意义的空集；
-// 领导者移除自己时，条目仍正常走多数派提交，提交后本节点停止参与。
+// ProposeConfChange 提交单节点成员变更（增/删一个投票成员）。
+// 这是向后兼容的便捷接口，等价于只含一个 Add 或 Remove 的批量变更：
+// 内部同样通过联合共识两阶段生效。
 func (n *Node) ProposeConfChange(client NodeID, cc ConfChange) ClientAck {
+	switch cc.Op {
+	case ConfAddVoter:
+		cc.Add, cc.Remove = []NodeID{cc.Node}, nil
+	case ConfRemoveVoter:
+		cc.Add, cc.Remove = nil, []NodeID{cc.Node}
+	default:
+		return ClientAck{To: client, Term: n.Term(), Reason: ReasonBadConfChange}
+	}
+	cc.Op = ConfBatchVoters
+	return n.ProposeConfChangeBatch(client, cc)
+}
+
+// ProposeConfChangeBatch 提交一批成员变更：Add 与 Remove 可各自包含多个节点，
+// 也允许同时非空（一次里既加又删）。整批变更原子打包为一条 enter-joint
+// 配置条目，按联合共识两阶段生效：
+//
+//  1. enter-joint（C_old,new）落盘后，选举/复制/提交同时受旧、新两份成员表约束；
+//  2. enter-joint 经旧、新双方多数派提交后，领导者自动追加 leave-joint（C_new）；
+//  3. leave-joint 提交后整批变更才算最终落定，期间拒绝发起下一批。
+//
+// 返回成功仅表示 enter-joint 条目已在领导者落盘。
+func (n *Node) ProposeConfChangeBatch(client NodeID, cc ConfChange) ClientAck {
 	if !n.alive || n.removed {
 		return ClientAck{To: client, Term: n.Term(), Reason: ReasonShutdown}
 	}
@@ -440,42 +590,173 @@ func (n *Node) ProposeConfChange(client NodeID, cc ConfChange) ClientAck {
 	if n.pendingConf {
 		return ClientAck{To: client, Term: n.Term(), Reason: ReasonMembershipPending}
 	}
-	next := n.membership.Apply(cc)
-	if next.Size() == 0 {
-		return ClientAck{To: client, Term: n.Term(), Reason: ReasonUnknownVoter}
+	cc.normalize()
+	if cc.Op != ConfBatchVoters {
+		return ClientAck{To: client, Term: n.Term(), Reason: ReasonBadConfChange}
 	}
-	if cc.Op == ConfRemoveVoter && !n.membership.Contains(cc.Node) {
-		return ClientAck{To: client, Term: n.Term(), Reason: ReasonUnknownVoter}
+	// 合法性校验（全部针对当前“已落定”的普通配置）。
+	cur := n.membership.PlainList()
+	curSet := map[NodeID]struct{}{}
+	for _, id := range cur {
+		curSet[id] = struct{}{}
 	}
-	if cc.Op == ConfAddVoter && n.membership.Contains(cc.Node) {
-		return ClientAck{To: client, Term: n.Term(), Reason: ReasonUnknownVoter}
+	addSet := map[NodeID]struct{}{}
+	remSet := map[NodeID]struct{}{}
+	for _, id := range cc.Add {
+		addSet[id] = struct{}{}
+	}
+	for _, id := range cc.Remove {
+		remSet[id] = struct{}{}
+	}
+	if len(cc.Add) == 0 && len(cc.Remove) == 0 {
+		return ClientAck{To: client, Term: n.Term(), Reason: ReasonBadConfChange}
+	}
+	for id := range addSet {
+		if _, dup := remSet[id]; dup {
+			// 同一批里又加又删同一个节点属于歧义请求，显式拒绝。
+			return ClientAck{To: client, Term: n.Term(), Reason: ReasonBadConfChange}
+		}
+		if _, exists := curSet[id]; exists {
+			return ClientAck{To: client, Term: n.Term(), Reason: ReasonUnknownVoter}
+		}
+	}
+	for id := range remSet {
+		if _, exists := curSet[id]; !exists {
+			return ClientAck{To: client, Term: n.Term(), Reason: ReasonUnknownVoter}
+		}
+	}
+	// 目标配置 C_new 不能为空（否则集群失去多数派意义）。
+	target := NewMembership()
+	for _, id := range cur {
+		if _, drop := remSet[id]; !drop {
+			target.oldVoters[id] = struct{}{}
+		}
+	}
+	for id := range addSet {
+		target.oldVoters[id] = struct{}{}
+	}
+	if target.Size() == 0 {
+		return ClientAck{To: client, Term: n.Term(), Reason: ReasonBadConfChange}
+	}
+
+	// 落盘 enter-joint 条目（保留原始单节点 Op 语义仅为日志可读，
+	// 协议处理统一以 Phase=enter + Add/Remove 为准）。
+	enter := ConfChange{Op: cc.Op, Add: cc.Add, Remove: cc.Remove, Phase: ConfPhaseEnter}
+	if len(cc.Add) == 1 && len(cc.Remove) == 0 {
+		enter.Op = ConfAddVoter
+		enter.Node = cc.Add[0]
+	} else if len(cc.Remove) == 1 && len(cc.Add) == 0 {
+		enter.Op = ConfRemoveVoter
+		enter.Node = cc.Remove[0]
 	}
 	n.prevMembership = n.membership
-	idx := n.st.AppendNew(n.Term(), LogEntry{Kind: KindConfChange, Payload: encodeConfChange(cc)})
+	idx := n.st.AppendNew(n.Term(), LogEntry{Kind: KindConfChange, Payload: encodeConfChange(enter)})
 	n.matchIndex[n.id] = idx
 	n.pendingConf = true
 	n.pending = append(n.pending, pendingProposal{index: idx, ackTo: client, kind: KindConfChange})
-	// 单节点变更规则：领导者条目一落盘即按新配置计算多数派与复制目标。
-	n.membership = next
-	if cc.Op == ConfAddVoter {
-		if _, ok := n.matchIndex[cc.Node]; !ok {
-			n.matchIndex[cc.Node] = 0
-			n.nextIndex[cc.Node] = n.st.LastIndex() + 1
+	// 联合共识规则：enter-joint 一落盘即按 C_old,new 计算双方多数派与复制目标。
+	n.reconcileMembership()
+	// 为新增节点初始化复制进度。
+	for _, peer := range n.membership.NewList() {
+		if _, ok := n.matchIndex[peer]; !ok {
+			n.matchIndex[peer] = 0
+			n.nextIndex[peer] = n.st.LastIndex() + 1
 		}
 	}
 	n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
-		"领导者落盘成员变更 index=%d op=%d node=%s 新成员数=%d 新多数派=%d",
-		idx, cc.Op, cc.Node, next.Size(), next.Quorum())
+		"领导者落盘 enter-joint index=%d 增=%v 删=%v 旧成员=%d 新成员=%d 旧多数派=%d 新多数派=%d",
+		idx, cc.Add, cc.Remove, len(n.prevMembership.PlainList()),
+		n.membership.NewQuorum(), n.membership.OldQuorum(), n.membership.NewQuorum())
 	n.netEmit(ClientAck{To: client, Term: n.Term(), Index: idx, Success: true, Reason: ReasonOK})
 	return ClientAck{To: client, Term: n.Term(), Index: idx, Success: true, Reason: ReasonOK}
 }
 
-// HandleVote 处理投票请求。
+// maybeCompleteJointChange 在领导者处于联合配置（C_old,new）且 enter-joint 已提交、
+// 但尚无 leave-joint 条目时，自动追加 leave-joint 条目，把变更推到完成。
+// 该方法幂等：任何 Tick、提交推进或新领导者接管时都可安全调用。
+func (n *Node) maybeCompleteJointChange() []OutMsg {
+	if n.role != Leader || !n.membership.IsJoint() {
+		return nil
+	}
+	last := n.lastConfIndex()
+	if last == 0 {
+		return nil
+	}
+	e, ok := n.st.EntryAt(last)
+	if !ok || e.Kind != KindConfChange {
+		return nil
+	}
+	prevCC, err := decodeConfChange(e.Payload)
+	if err != nil {
+		return nil
+	}
+	// 已有 leave-joint（无论是否提交），不得重复追加。
+	if prevCC.Phase == ConfPhaseLeave {
+		return nil
+	}
+	// enter-joint 未提交前不允许追加 leave-joint。
+	if last > n.commitIndex {
+		return nil
+	}
+	leave := ConfChange{
+		Op:     prevCC.Op,
+		Node:   prevCC.Node,
+		Add:    prevCC.Add,
+		Remove: prevCC.Remove,
+		Phase:  ConfPhaseLeave,
+	}
+	n.prevMembership = n.membership
+	idx := n.st.AppendNew(n.Term(), LogEntry{Kind: KindConfChange, Payload: encodeConfChange(leave)})
+	n.matchIndex[n.id] = idx
+	n.pendingConf = true
+	// leave 一落盘即切换到 C_new；提交前复制目标仍取 C_old,new ∪ C_new（=并集）。
+	n.reconcileMembership()
+	n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
+		"enter-joint 已提交，领导者自动追加 leave-joint index=%d 新成员=%v 新多数派=%d",
+		idx, n.membership.PlainList(), n.membership.NewQuorum())
+	return n.broadcastAppend()
+}
+
+// HandleVote 处理投票请求（含预投票）。
 func (n *Node) HandleVote(m RequestVote) []OutMsg {
 	if !n.alive || n.removed {
 		return nil
 	}
 	reply := RequestVoteResult{From: n.id, To: m.From, Term: n.st.CurrentTerm()}
+
+	// 预投票：不改变任何持久状态（任期、投票均不动），只做资格判断。
+	// 陈旧节点的预投票拿不到多数派，就永远不会用真实高任期打断在任领导者。
+	if m.PreVote {
+		// 预投票任期号必须严格高于本地当前任期（候选人探测的是“下一任期”）。
+		if m.Term <= n.st.CurrentTerm() {
+			return []OutMsg{{To: m.From, RPC: &RequestVoteResult{
+				From: n.id, To: m.From, Term: n.st.CurrentTerm(), Reason: ReasonStaleTerm, PreVote: true,
+			}}}
+		}
+		// 仅当近期确实收到现任领导者心跳（租约窗口内）才拒绝；
+		// 领导者已停摆超过一个选举超时后，残留的 n.leader 不得继续压制选举。
+		// 本节点自己也已发起预投票时，同样不再用残留租约压制同任期竞选者
+		//（双方都判定领导者失联，应允许预投票决出更合适的候选人）。
+		if !n.preVoting && n.leader != "" && n.electionElapsed < electionMin && m.From != n.leader {
+			n.log.Debugf(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonLeaderLease,
+				"拒绝预投票给 %s：现任领导者 %s 心跳仍有效", m.From, n.leader)
+			return []OutMsg{{To: m.From, RPC: &RequestVoteResult{
+				From: n.id, To: m.From, Term: n.st.CurrentTerm(), Reason: ReasonLeaderLease, PreVote: true,
+			}}}
+		}
+		myLastTerm, _ := n.st.TermAt(n.st.LastIndex())
+		if m.LastLogTerm < myLastTerm ||
+			(m.LastLogTerm == myLastTerm && m.LastLogIndex < n.st.LastIndex()) {
+			return []OutMsg{{To: m.From, RPC: &RequestVoteResult{
+				From: n.id, To: m.From, Term: n.st.CurrentTerm(), Reason: ReasonLogNotUpToDate, PreVote: true,
+			}}}
+		}
+		n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
+			"预投票赞成 %s（候选人日志 t=%d i=%d）", m.From, m.LastLogTerm, m.LastLogIndex)
+		return []OutMsg{{To: m.From, RPC: &RequestVoteResult{
+			From: n.id, To: m.From, Term: n.st.CurrentTerm(), Granted: true, Reason: ReasonOK, PreVote: true,
+		}}}
+	}
 
 	if m.Term < n.st.CurrentTerm() {
 		reply.Reason = ReasonStaleTerm
@@ -524,11 +805,71 @@ func (n *Node) HandleVote(m RequestVote) []OutMsg {
 	return []OutMsg{{To: m.From, RPC: &reply}}
 }
 
-// HandleVoteResult 处理投票应答。
+// voteMajority 在给定赞成票集合上判断是否满足当选多数派：
+// 普通配置一次多数派；联合配置必须旧集合与新集合分别多数派
+// （保证联合阶段绝不可能选出一个只被单边承认、却能推进提交的领导者）。
+// 多数派只在“存活且可达”的成员上计算：确认已停止/被隔离的成员无法再表态，
+// 不应永久占用席位锁死集群（Ongaro 论文 §6.3 的联合阶段活性处理）。
+func (n *Node) voteMajority(ballots map[NodeID]bool) bool {
+	count := func(voters []NodeID) bool {
+		granted, reachable := 0, 0
+		for _, v := range voters {
+			if !n.canReach(v) {
+				continue
+			}
+			reachable++
+			if ballots[v] {
+				granted++
+			}
+		}
+		need := reachable/2 + 1
+		return reachable > 0 && granted >= need
+	}
+	if !count(n.membership.NewList()) {
+		return false
+	}
+	if n.membership.IsJoint() && !count(n.membership.OldList()) {
+		return false
+	}
+	return true
+}
+
+// HandleVoteResult 处理投票应答（含预投票应答）。
 func (n *Node) HandleVoteResult(m RequestVoteResult) []OutMsg {
 	if !n.alive || n.removed {
 		return nil
 	}
+
+	// 预投票应答：节点此时仍是 follower/preVoting，任期未变。
+	if m.PreVote {
+		if !n.preVoting {
+			return nil
+		}
+		// 应答带回的任期高于本地，说明集群已有更高任期的活动：放弃本轮预投票。
+		if m.Term > n.st.CurrentTerm() {
+			n.stepDownFromHigherTerm(m.Term)
+			n.preVoting = false
+			return nil
+		}
+		n.preVotes[m.From] = m.Granted
+		if !m.Granted {
+			n.log.Debugf(string(n.id), n.Term(), n.quorum(), n.commitIndex, m.Reason,
+				"预投票未获得 %s 赞成", m.From)
+		}
+		// 预投票里自己算一张赞成票（自己当然支持自己参选）。
+		pre := map[NodeID]bool{n.id: true}
+		for k, v := range n.preVotes {
+			pre[k] = v
+		}
+		if n.voteMajority(pre) {
+			n.preVoting = false
+			n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
+				"预投票获得多数派，开始正式选举 joint=%v", n.membership.IsJoint())
+			return n.becomeCandidate()
+		}
+		return nil
+	}
+
 	n.stepDownFromHigherTerm(m.Term)
 	if n.role != Candidate || m.Term != n.st.CurrentTerm() {
 		// 已不再是该任期的候选人，应答仅用于任期校正，忽略计票。
@@ -541,15 +882,10 @@ func (n *Node) HandleVoteResult(m RequestVoteResult) []OutMsg {
 		n.log.Debugf(string(n.id), n.Term(), n.quorum(), n.commitIndex, m.Reason,
 			"未获得 %s 的选票", m.From)
 	}
-	granted := 0
-	for _, v := range n.votes {
-		if v {
-			granted++
-		}
-	}
 	n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
-		"计票：赞成=%d 多数派=%d 总成员=%d", granted, n.quorum(), n.membership.Size())
-	if granted >= n.quorum() {
+		"计票：赞成=%d 多数派=%d 总成员=%d joint=%v",
+		len(n.votes), n.quorum(), n.membership.Size(), n.membership.IsJoint())
+	if n.voteMajority(n.votes) {
 		return n.becomeLeader()
 	}
 	return nil
@@ -618,7 +954,9 @@ func (n *Node) HandleAppend(m AppendEntries) []OutMsg {
 }
 
 // findConflict 依据本地日志给出快速回退提示：
-// 若 prevIndex 处存在旧任期，返回该任期的第一条索引；否则返回 prevIndex。
+//   - prevIndex 处存在条目但任期不符：返回该冲突任期在本地的第一条索引；
+//   - prevIndex 处缺条目（日志太短）：返回本地最后一条之后的位置，
+//     即“把 nextIndex 退到本地末尾之后”，让领导者从本地末尾紧接着补发。
 func (n *Node) findConflict(prevIndex int) (int, int) {
 	if e, ok := n.st.EntryAt(prevIndex); ok {
 		term := e.Term
@@ -632,51 +970,43 @@ func (n *Node) findConflict(prevIndex int) (int, int) {
 		}
 		return idx, term
 	}
-	return prevIndex, 0
+	// 本地没有 prevIndex：缺口从本地最后一条之后开始。
+	return n.st.LastIndex() + 1, 0
 }
 
-// refreshMembershipThrough 重放至 throughIndex 的配置条目，更新生效配置。
-// 多数派计数可以在条目落盘后立即按新配置进行（单节点变更规则），
-// 但节点“退出协议（removed）”只能在该变更已提交后发生：
+// refreshMembershipThrough 依据落盘到 throughIndex 的日志重建生效配置。
+// 条目一旦落盘即按新配置计票/计多数派（联合共识规则：
+// enter-joint 落盘即要求旧∪新双方多数派才能提交）；
+// 但节点“退出协议（removed）”只能在移除配置已提交后发生：
 // 否则被移除者会错过携带提交点的心跳，永远无法确认自己的移除已提交。
 func (n *Node) refreshMembershipThrough(through int) {
-	lastConfIndex := 0
-	for _, e := range n.st.AllEntries() {
-		if e.Index > through {
-			break
-		}
-		if e.Kind == KindConfChange {
-			if cc, err := decodeConfChange(e.Payload); err == nil {
-				n.membership = n.membership.Apply(cc)
-				lastConfIndex = e.Index
-			}
-		}
-	}
-	if lastConfIndex > 0 {
-		n.pendingConf = lastConfIndex > n.commitIndex
+	jointBefore := n.membership.IsJoint()
+	n.reconcileMembership()
+	jointAfter := n.membership.IsJoint()
+	last := n.lastConfIndex()
+	if last > 0 && (last <= through || jointBefore || jointAfter) {
 		n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
-			"配置随日志生效 成员数=%d 多数派=%d pendingConf=%v",
-			n.membership.Size(), n.quorum(), n.pendingConf)
+			"配置随日志重建 成员数=%d 多数派=%d joint=%v pendingConf=%v",
+			n.membership.Size(), n.quorum(), jointAfter, n.pendingConf)
 	}
 	n.observeSelfRemoved()
 }
 
-// observeSelfRemoved 在“移除自己”的配置已提交后才退出协议。
-// 判定依据：当前生效配置（来自日志或快照，均为已提交/已确认的配置视图）
-// 不再包含自己，且该配置的来源位置不超过 commitIndex。
+// observeSelfRemoved 只在“移除自己”的配置已经提交、且配置已离开联合阶段后
+// 才退出协议：联合阶段被移除者仍属于 C_old，必须继续参与复制与投票，
+// 直到 leave-joint（C_new）提交，才能确认自己被安全移除。
 func (n *Node) observeSelfRemoved() {
-	if n.removed || n.membership.Size() == 0 || n.membership.Contains(n.id) {
+	if n.removed || n.membership.IsJoint() || n.membership.Size() == 0 {
 		return
 	}
-	// 找到最近一次配置条目的索引；若配置仅来自快照，则位置就是快照点。
-	lastConfIndex := 0
-	if n.st.HasSnapshot() {
-		lastConfIndex = n.st.SnapshotCopy().LastIncludedIndex
+	if n.membership.Contains(n.id) {
+		return
 	}
-	for _, e := range n.st.AllEntries() {
-		if e.Kind == KindConfChange {
-			lastConfIndex = e.Index
-		}
+	// 定位当前配置的来源位置：优先现存日志最后一条配置条目，
+	// 配置仅存在于快照中时退化为快照点。
+	lastConfIndex := n.lastConfIndex()
+	if lastConfIndex == 0 && n.st.HasSnapshot() {
+		lastConfIndex = n.st.SnapshotCopy().LastIncludedIndex
 	}
 	if lastConfIndex > 0 && lastConfIndex <= n.commitIndex {
 		n.markRemoved()
@@ -718,21 +1048,8 @@ func (n *Node) applyCommitted() {
 		}
 		n.lastApplied = idx
 	}
-	// 成员变更一旦提交，解除 pending 阻塞。
-	if n.pendingConf {
-		lastConf := 0
-		for _, e := range n.st.AllEntries() {
-			if e.Kind == KindConfChange {
-				lastConf = e.Index
-			}
-		}
-		if lastConf <= n.commitIndex && lastConf > 0 {
-			n.pendingConf = false
-			n.prevMembership = Membership{}
-			n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
-				"成员变更已提交（index=%d），允许下一次变更", lastConf)
-		}
-	}
+	// 配置条目提交后重建配置视图：可能解除 pending，或从联合阶段转入下一阶段。
+	n.reconcileMembership()
 	n.resolvePendingProposals()
 	n.observeSelfRemoved()
 }
@@ -816,32 +1133,30 @@ func (n *Node) HandleAppendResult(m AppendResult) []OutMsg {
 
 	// 多数派提交判定：在当前任期的日志中，找出复制到多数派的最高索引 N，
 	// 仅提交当前任期条目（图 8 安全性），历史任期条目随后随 N 一起提交。
+	// 联合阶段必须分别获得 C_old 与 C_new 的多数派。
 	last := n.st.LastIndex()
 	for cand := last; cand > n.commitIndex; cand-- {
 		term, ok := n.st.TermAt(cand)
 		if !ok || term != n.st.CurrentTerm() {
 			continue
 		}
-		count := 1 // 领导者自身
-		for _, voter := range n.membership.List() {
-			if voter != n.id && n.matchIndex[voter] >= cand {
-				count++
-			}
+		if !n.membership.CountMajorities(cand, n.id, n.matchIndex) {
+			continue
 		}
-		if count >= n.quorum() {
-			// 若本次提交结束了一个待生效成员变更，先固定旧∪新并集，
-			// 保证被移除节点也收到携带新提交点的最后一次追加/心跳。
-			finalPeers := n.replicationPeers()
-			n.advanceCommitTo(cand, "多数派复制确认")
-			n.refreshMembershipThrough(n.commitIndex)
-			for _, peer := range finalPeers {
-				out = append(out, n.appendTo(peer))
-			}
-			n.applyCommitted()
-			// 提交点变化后向新配置集合再广播一次，加速收敛。
-			out = append(out, n.broadcastAppend()...)
-			break
+		// 提交可能让 enter-joint 落定：先固定旧∪新并集，
+		// 保证被移除节点也收到携带新提交点的最后一次追加/心跳。
+		finalPeers := n.replicationPeers()
+		n.advanceCommitTo(cand, "多数派复制确认")
+		n.refreshMembershipThrough(n.commitIndex)
+		for _, peer := range finalPeers {
+			out = append(out, n.appendTo(peer))
 		}
+		n.applyCommitted()
+		// enter-joint 提交后自动进入第二阶段：追加 leave-joint 条目。
+		out = append(out, n.maybeCompleteJointChange()...)
+		// 提交点变化后向当前复制集合再广播一次，加速收敛。
+		out = append(out, n.broadcastAppend()...)
+		break
 	}
 	return out
 }
@@ -901,8 +1216,8 @@ func (n *Node) HandleSnapshot(m InstallSnapshot) []OutMsg {
 	}
 	n.commitIndex = m.LastIncludedIndex
 	n.lastApplied = m.LastIncludedIndex
-	n.membership = m.Membership
-	n.pendingConf = false
+	// 快照本身只会在非联合位置生成；快照之后若仍有配置条目则统一重放重建。
+	n.reconcileMembership()
 	// 注意：不在此依据快照配置判定“自己被移除”。
 	// 追赶中的新节点可能收到不含自己的旧配置快照；是否被移除必须在补齐
 	// 快照之后的配置条目后，由 observeSelfRemoved 结合完整配置视图判定。
@@ -952,6 +1267,14 @@ func (n *Node) CreateSnapshot(index int) (Snapshot, error) {
 		n.log.Warnf(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonSnapshotBehindCommit,
 			"拒绝压缩未提交位置 index=%d commit=%d", index, n.commitIndex)
 		return Snapshot{}, fmt.Errorf("snapshot: index %d 超过已提交位置 %d", index, n.commitIndex)
+	}
+	// 联合配置期间不允许压缩：快照只保存一份成员表，无法完整携带 C_old,new
+	// 双集合状态；在联合阶段停留只是暂时的，等 leave-joint 提交后再压缩即可。
+	snapMembership := n.membershipAt(index)
+	if snapMembership.IsJoint() {
+		n.log.Warnf(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonSnapshotJoint,
+			"拒绝在联合配置生效位置压缩 index=%d（等待 leave-joint 提交）", index)
+		return Snapshot{}, fmt.Errorf("snapshot: index %d 处于联合配置，无法压缩", index)
 	}
 	data := n.fsm.Snapshot()
 	snap, err := n.st.Compact(index, data)

@@ -23,6 +23,8 @@ const (
 	ReasonDeposed               Reason = "deposed"                 // 发现更高任期，领导者被罢免
 	ReasonMembershipPending     Reason = "membership-pending"      // 上一次成员变更尚未提交
 	ReasonUnknownVoter          Reason = "unknown-voter"           // 目标节点不在当前配置中
+	ReasonBadConfChange         Reason = "bad-conf-change"         // 批量变更内容非法（空目标、同批又加又删同一节点等）
+	ReasonSnapshotJoint         Reason = "snapshot-joint"          // 联合配置生效期间不允许压缩日志
 	ReasonSnapshotBehindCommit  Reason = "snapshot-behind-commit"  // 快照落后于已提交位置
 	ReasonRejectedByApplication Reason = "rejected-by-application" // 应用层拒绝应用
 	ReasonDuplicate             Reason = "duplicate"               // 幂等命中：重复消息/重复条目
