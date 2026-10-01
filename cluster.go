@@ -44,6 +44,10 @@ type Cluster struct {
 	rng    *rand.Rand
 	ticks  int
 
+	// learners 记录以无投票权身份加入编排、等待成员变更生效的追赶节点。
+	// 它们会收到日志/快照复制但不计入多数派；成员变更落定后自动从中移除。
+	learners map[NodeID]bool
+
 	// 客户端提案应答收集（键为客户端标识）。
 	acks map[NodeID][]ClientAck
 
@@ -64,6 +68,7 @@ func NewCluster(ids []NodeID, opts ...ClusterOption) *Cluster {
 		nodes:     map[NodeID]*Node{},
 		stores:    map[NodeID]*Storage{},
 		fsms:      map[NodeID]*KVState{},
+		learners:  map[NodeID]bool{},
 		acks:      map[NodeID][]ClientAck{},
 		seed:      1,
 		logWriter: io.Discard,
@@ -235,6 +240,14 @@ func (c *Cluster) Step() {
 			c.net.Send(target.id, r)
 		}
 	}
+	// learner 的日志一旦收到包含自己的 enter-joint 条目，它在联合期间就已是
+	// C_new 的正式投票成员（须参与新配置多数派）；此时即应从 learner 视图摘除，
+	// 不必等到 leave-joint 提交，否则会被错误地排除出收敛判定。
+	for id := range c.learners {
+		if n, ok := c.nodes[id]; ok && n.isVoter(id) {
+			delete(c.learners, id)
+		}
+	}
 	c.ticks++
 }
 
@@ -257,10 +270,14 @@ func (c *Cluster) WaitCommit(index, maxTicks int) error {
 }
 
 // committedEverywhere 判定 index 是否被当前在线、未被隔离、且仍属于其生效配置的成员提交并应用。
-// 已通过成员变更移除的节点不再属于集群，不参与收敛判定（其已提交数据保留在其它节点）。
+// 已通过成员变更移除的节点不再属于集群，不参与收敛判定（其已提交数据保留在其它节点）；
+// 无投票权 learner 也不参与收敛判定（追赶进度不影响集群提交）。
 func (c *Cluster) committedEverywhere(index int) bool {
 	for _, n := range c.nodes {
 		if !n.Alive() || n.removed || c.net.partitioned[n.id] {
+			continue
+		}
+		if c.learners[n.id] && !n.isVoter(n.id) {
 			continue
 		}
 		// 节点自身的生效配置已不含自己：说明“移除自己”的变更已在该节点提交。
@@ -297,37 +314,163 @@ func (c *Cluster) StartNode(id NodeID) error {
 	}
 	// 重新构造逻辑层即可模拟“重启”：Storage 持久状态不丢，FSM 保留。
 	c.nodeSeedCounter++
-	repl := NewNode(id, n.membership, c.stores[id], c.fsms[id], c.log, c.seed*2000+c.nodeSeedCounter)
+	var repl *Node
+	if c.stores[id].LastIndex() == 0 && !c.stores[id].HasSnapshot() {
+		// 尚未追平任何日志就重启的节点仍是空日志追赶者，走 join 路径。
+		repl = NewJoinNode(id, c.stores[id], c.fsms[id], c.log, c.seed*2000+c.nodeSeedCounter)
+	} else {
+		repl = NewNode(id, n.membership, c.stores[id], c.fsms[id], c.log, c.seed*2000+c.nodeSeedCounter)
+	}
 	repl.SetEmitter(func(m OutMsg) { c.collectAck(m) })
+	// 重启后重建 learner 注册表：集群已知的 learner 全部重新登记。
+	for lid := range c.learners {
+		repl.AddLearner(lid)
+	}
 	repl.Start()
 	c.nodes[id] = repl
 	return nil
 }
 
-// AddNode 创建一个全新空日志节点并纳入编排；必须随后提交 ConfAddVoter 变更，
-// 新节点才会成为投票成员并通过日志/快照追赶到一致状态。
+// AddNode 创建一个全新空日志节点并纳入编排，以无投票权 learner 身份开始追赶：
+// 它立即接收领导者的日志/快照复制，但不投票、不计入多数派、不能参选；
+// 必须随后通过 ProposeConfChange(ConfAddVoter) 或 ProposeBatchConfChange
+// 提交成员变更，落定后才成为投票成员。
+// 若同名节点此前已被移除（含其持久存储），这里以全新空身份重新加入，
+// 旧成员表与旧日志不会影响集群判断。
 func (c *Cluster) AddNode(id NodeID) error {
 	if _, exists := c.nodes[id]; exists {
 		return fmt.Errorf("节点 %s 已存在", id)
 	}
+	// 曾经存在且被移除的节点：清掉旧持久状态，按全新成员重新加入。
+	delete(c.stores, id)
+	delete(c.fsms, id)
 	c.nodeSeedCounter++
 	st := NewStorage(id, c.log)
 	fsm := NewKVState()
-	// 新节点空日志加入，不写本地引导配置，完全由领导者补齐。
 	n := NewJoinNode(id, st, fsm, c.log, c.seed*3000+c.nodeSeedCounter)
 	n.SetEmitter(func(m OutMsg) { c.collectAck(m) })
 	n.Start()
 	c.nodes[id] = n
 	c.stores[id] = st
 	c.fsms[id] = fsm
-	c.log.Infof(string(id), 0, 0, 0, ReasonOK, "新节点已加入编排（等待成员变更生效）")
+	c.learners[id] = true
+	// 向所有在线节点注册 learner：领导者立即开始向它复制，
+	// 其余节点注册后可在当选领导者时无缝接管复制。
+	for _, peer := range c.nodes {
+		peer.AddLearner(id)
+	}
+	n.AddLearner(id) // 自身也记录，防止它在追平前因超时误发起选举
+	c.log.Infof(string(id), 0, 0, 0, ReasonOK, "新节点以 learner 身份加入编排（无投票权，等待成员变更生效）")
 	return nil
 }
 
-// RemoveNode 从编排中彻底移除节点（通常在 ConfRemoveVoter 提交之后调用）。
+// ProposeBatchConfChange 原子提交一批成员变更（联合共识两阶段）。
+// 调用前请先用 AddNode 把新增节点加入编排；本方法会先等待新增 learner 追平，
+// 再提交 enter-joint，并推进到 leave-joint 提交、全部存活成员收敛后返回。
+// 变更期间普通命令的提交不被阻塞。
+func (c *Cluster) ProposeBatchConfChange(client NodeID, b BatchConfChange) (int, Reason) {
+	l := c.Leader()
+	if l == "" {
+		return 0, ReasonNoQuorum
+	}
+	leader := c.nodes[l]
+	// 先让全部新增 learner 追平领导者日志，保证联合阶段不拖慢普通提交。
+	for _, add := range b.Adds {
+		if _, ok := c.nodes[add]; !ok {
+			return 0, ReasonUnknownVoter
+		}
+	}
+	if r := c.waitLearnersCaughtUp(leader, b.Adds, 400); r != ReasonOK {
+		return 0, r
+	}
+	ack := leader.ProposeBatchConfChange(client, b)
+	if !ack.Success {
+		return 0, ack.Reason
+	}
+	if r := c.waitBatchConfComplete(500); r != ReasonOK {
+		return ack.Index, r
+	}
+	return ack.Index, ReasonOK
+}
+
+// waitLearnersCaughtUp 推进仿真直到领导者视角里全部新增节点都已复制并确认到
+// 领导者最新日志。以领导者 matchIndex 为准（而非 learner 本地提交点）：
+// 必须确认成功应答已回到领导者，随后 enter-joint 落盘时它们才能立刻计票。
+func (c *Cluster) waitLearnersCaughtUp(leader *Node, adds []NodeID, maxTicks int) Reason {
+	for i := 0; i < maxTicks; i++ {
+		caught := true
+		for _, add := range adds {
+			n, ok := c.nodes[add]
+			if !ok || !n.Alive() {
+				return ReasonShutdown
+			}
+			if leader.matchIndex[add] < leader.st.LastIndex() {
+				caught = false
+			}
+		}
+		if caught {
+			return ReasonOK
+		}
+		c.Step()
+	}
+	return ReasonLearnerLagging
+}
+
+// waitBatchConfComplete 推进直到领导者完成联合共识（leave-joint 提交）、
+// 不再处于联合/待生效状态，或超时。
+func (c *Cluster) waitBatchConfComplete(maxTicks int) Reason {
+	for i := 0; i < maxTicks; i++ {
+		l := c.Leader()
+		if l != "" {
+			leader := c.nodes[l]
+			if leader.IsBatchConfComplete() {
+				// 再推进若干 tick，让提交点与最终配置扩散到全部存活复制目标。
+				c.RunUntil(10)
+				return ReasonOK
+			}
+		}
+		c.Step()
+	}
+	return ReasonNoQuorum
+}
+
+// WaitMembershipConverged 推进直到所有在线、未分区、未移除的成员
+// 都收敛到完全相同的投票成员表（按字典序比较），或超时。
+func (c *Cluster) WaitMembershipConverged(want []NodeID, maxTicks int) error {
+	wantM := NewMembership(want...)
+	for i := 0; i < maxTicks; i++ {
+		ok := true
+		for _, n := range c.nodes {
+			if !n.Alive() || n.removed || c.net.partitioned[n.id] {
+				continue
+			}
+			if n.Membership().Size() > 0 && !n.Membership().Contains(n.id) {
+				continue // 已在本节点提交移除自己，等待编排摘除
+			}
+			if n.Joint() || !n.Membership().Equal(wantM) {
+				ok = false
+				break
+			}
+		}
+		if ok {
+			return nil
+		}
+		c.Step()
+	}
+	return fmt.Errorf("等待成员表收敛到 %v 超时（%d ticks）", want, maxTicks)
+}
+
+// RemoveNode 从编排中彻底移除节点（通常在 ConfRemoveVoter/批量缩容提交之后调用）。
+// 其持久存储一并丢弃；日后以同名 AddNode 重新加入时按全新空日志节点对待。
 func (c *Cluster) RemoveNode(id NodeID) {
 	delete(c.nodes, id)
-	c.log.Warnf(string(id), 0, 0, 0, ReasonOK, "节点已从集群编排移除")
+	delete(c.stores, id)
+	delete(c.fsms, id)
+	delete(c.learners, id)
+	for _, n := range c.nodes {
+		n.RemoveLearner(id)
+	}
+	c.log.Warnf(string(id), 0, 0, 0, ReasonOK, "节点已从集群编排移除（旧存储丢弃）")
 }
 
 // TriggerSnapshot 要求节点在 index 处做日志压缩快照（index<=0 表示在提交点）。
@@ -359,6 +502,8 @@ func (c *Cluster) State(id NodeID) NodeView {
 		LastIndex:   n.st.LastIndex(),
 		Alive:       n.Alive(),
 		Members:     n.Membership().List(),
+		Joint:       n.Joint(),
+		Learner:     c.learners[id] && !n.isVoter(id),
 	}
 }
 
@@ -373,6 +518,8 @@ type NodeView struct {
 	LastIndex   int
 	Alive       bool
 	Members     []NodeID
+	Joint       bool
+	Learner     bool
 }
 
 // Ticks 返回已推进的时间单位数。

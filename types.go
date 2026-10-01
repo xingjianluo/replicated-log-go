@@ -64,6 +64,12 @@ const (
 	// ConfSetVoters 仅用于集群引导：用完整成员列表一次性建立初始配置，
 	// 作为 index=1 的引导条目，使后续新增节点可通过日志重放得到配置。
 	ConfSetVoters
+	// ConfEnterJoint / ConfLeaveJoint 用于批量成员变更（联合共识两阶段）：
+	// enter-joint 条目的 Members 是目标配置 C_new；该条目生效后集群处于
+	// C_old∪C_new 联合配置，提交与选举都必须同时拿到双方多数派；
+	// 紧随其后的 leave-joint 条目（Members 同为 C_new）提交后，集群切换到 C_new。
+	ConfEnterJoint
+	ConfLeaveJoint
 )
 
 // ConfChange 描述一次单节点成员变更。
@@ -71,7 +77,35 @@ const (
 type ConfChange struct {
 	Op      ConfChangeOp
 	Node    NodeID
-	Members []NodeID // 仅 ConfSetVoters 使用
+	Members []NodeID // ConfSetVoters / ConfEnterJoint / ConfLeaveJoint 使用
+}
+
+// BatchConfChange 描述一次原子批量成员变更：Adds 与 Removes 在同一次
+// 联合共识变更中全部生效或全部不生效（随 enter-joint 条目被日志截断而放弃）。
+// 同一节点不允许同时出现在 Adds 与 Removes 中；Adds 不可与现有投票成员重复，
+// Removes 必须都是当前投票成员。
+type BatchConfChange struct {
+	Adds    []NodeID
+	Removes []NodeID
+}
+
+// TargetMembership 以当前配置 m 为基准计算批量变更后的目标配置。
+func (m Membership) TargetMembership(b BatchConfChange) Membership {
+	set := map[NodeID]struct{}{}
+	for _, id := range m.List() {
+		set[id] = struct{}{}
+	}
+	for _, id := range b.Removes {
+		delete(set, id)
+	}
+	for _, id := range b.Adds {
+		set[id] = struct{}{}
+	}
+	out := make([]NodeID, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	return NewMembership(out...)
 }
 
 // Membership 是一个不可变的投票成员集合。
@@ -137,12 +171,32 @@ func (m Membership) Equal(other Membership) bool {
 	return true
 }
 
+// Union 返回两个成员集合的并集（联合共识阶段 C_old∪C_new 的复制/投票对象）。
+func (m Membership) Union(other Membership) Membership {
+	set := map[NodeID]struct{}{}
+	for id := range m.voters {
+		set[id] = struct{}{}
+	}
+	for id := range other.voters {
+		set[id] = struct{}{}
+	}
+	out := make([]NodeID, 0, len(set))
+	for id := range set {
+		out = append(out, id)
+	}
+	return NewMembership(out...)
+}
+
 // Snapshot 是日志压缩快照。
 type Snapshot struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	// Membership 是快照对应位置已生效的成员配置。
 	Membership Membership
+	// JointValid 为 true 时表示快照点处于联合共识中间态：
+	// Membership 为 C_new，JointOld 为 C_old，双多数派约束仍然有效。
+	JointValid bool
+	JointOld   Membership
 	// Data 是应用层状态快照（本组件中为确定性命令序列的编码）。
 	Data []byte
 }
@@ -195,7 +249,10 @@ type InstallSnapshot struct {
 	LastIncludedIndex int
 	LastIncludedTerm  int
 	Membership        Membership
-	Data              []byte
+	// JointValid/JointOld 携带快照点的联合共识中间态，语义同 Snapshot。
+	JointValid bool
+	JointOld   Membership
+	Data       []byte
 }
 
 // InstallSnapshotResult 是快照安装结果。

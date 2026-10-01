@@ -153,11 +153,13 @@ func (s *Storage) Compact(index int, data []byte) (Snapshot, error) {
 	if s.snapshotValid && index < s.snapshot.LastIncludedIndex {
 		return Snapshot{}, fmt.Errorf("compact: 索引 %d 早于现有快照 %d", index, s.snapshot.LastIncludedIndex)
 	}
-	membership := s.latestMembershipAt(index)
+	membership, jointOld, jointValid := s.configViewAt(index)
 	snap := Snapshot{
 		LastIncludedIndex: index,
 		LastIncludedTerm:  term,
 		Membership:        membership,
+		JointValid:        jointValid,
+		JointOld:          jointOld,
 		Data:              append([]byte(nil), data...),
 	}
 	// 丢弃快照覆盖的条目；快照位置本身也不再保留在 entries 中。
@@ -176,24 +178,11 @@ func (s *Storage) Compact(index int, data []byte) (Snapshot, error) {
 	return snap, nil
 }
 
-// latestMembershipAt 找出 index（含）之前最近一次成员变更对应的配置；
-// 没有任何变更时返回空配置（调用方应保证快照前存在初始配置，见 Cluster）。
-func (s *Storage) latestMembershipAt(index int) Membership {
-	// 从当前快照配置出发（若有），重放到 index。
-	m := s.snapshot.Membership
-	start := s.FirstIndex()
-	for i := start; i <= index; i++ {
-		e, ok := s.EntryAt(i)
-		if !ok {
-			break
-		}
-		if e.Kind == KindConfChange {
-			if cc, err := decodeConfChange(e.Payload); err == nil {
-				m = m.Apply(cc)
-			}
-		}
-	}
-	return m
+// configViewAt 找出 index（含）处的配置视图：返回当前配置、是否处于
+// 联合共识中间态以及联合旧配置 C_old。重放从当前快照配置出发。
+func (s *Storage) configViewAt(index int) (Membership, Membership, bool) {
+	v := replayConfigView(s, index)
+	return v.current, v.jointOld, v.joint
 }
 
 // ApplySnapshot 用领导者快照覆盖本地状态；不允许回退已提交位置由 Node 层保证，

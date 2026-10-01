@@ -12,10 +12,10 @@
 | `logger.go` | 结构化判定日志（任期 / 多数派 / 提交位置 / 可区分原因码） |
 | `storage.go` | 单节点持久状态：当前任期、投票、日志、快照；显式冲突截断、日志压缩 |
 | `statemachine.go` | 确定性状态机接口 `FSM` 与按索引幂等的演示实现 `KVState` |
-| `node.go` | Raft 节点纯逻辑状态机：选举、复制、提交、快照、成员变更、重启恢复 |
+| `node.go` | Raft 节点纯逻辑状态机：选举、复制、提交、快照、单节点变更、批量变更（联合共识两阶段 + learner）、重启恢复 |
 | `network.go` | 确定性网络：分区、延迟、丢包、重复、乱序注入与可区分的故障统计 |
-| `cluster.go` | 仿真编排：确定性 Tick 循环、消息分发、节点增删/重启、观察视图 |
-| `cmd/demo/main.go` | 六个异常场景的可运行演示 |
+| `cluster.go` | 仿真编排：确定性 Tick 循环、消息分发、节点增删/重启、learner 注册、批量变更编排、观察视图 |
+| `cmd/demo/main.go` | 七个异常/运维场景的可运行演示 |
 | `*_test.go` | 20 个确定性场景测试 |
 
 ## 一致性协议要点
@@ -58,14 +58,44 @@
 - 严重落后节点（所需前缀已不在领导者日志中）通过 `InstallSnapshot` 恢复，
   快照点成为新的一致性锚点：下一条追加以快照点为 `PrevLogIndex`、快照任期为
   `PrevLogTerm`。已提交状态不受影响，提交位置不允许因旧快照回退。
-- 成员变更采用**单节点变更**（一次只增/删一个投票成员）：
-  - 上一次变更未提交时拒绝新变更（`membership-pending`），避免重叠配置；
-  - 变更条目落盘后即按**新配置**计算多数派（Raft 单服务器变更安全性）；
-  - 提交前领导者仍向“旧配置 ∪ 新配置”并集复制，
-    保证被移除者也能收到“移除自己”的条目与最终提交点；
-  - 节点仅在“移除自己”的变更**已提交**后才退出协议；
-  - 新加入节点以空日志启动（不写本地引导配置），在被加入配置前不参与投票，
-    通过日志重放（含 index=1 的引导配置条目）或快照获得一致状态；
+- 成员变更支持两种方式，均为**串行生效**（上一次未落定前拒绝下一次，
+  `membership-pending`）：
+  - **单节点变更**（`ProposeConfChange`，原有用法保持不变）：一次增/删一个
+    投票成员，变更条目落盘后即按新配置计算多数派（Raft 单服务器变更安全性），
+    提交前向旧∪新并集复制。
+  - **批量成员变更**（`ProposeBatchConfChange`，新增）：一次原子提交多个增删，
+    内部用 Raft **联合共识（Joint Consensus）两阶段**完成：
+    1. 新增节点先以 **learner（无投票权）**身份加入，立即接收日志/快照复制
+       追平到领导者（不计多数派、不参选、不投票）；
+    2. 追加 `enter-joint(C_old,new)` 条目：其提交必须**同时**拿到 C_old 与
+       C_new 双方多数派，期间集群处于联合配置 C_old∪C_new，选举同样要求
+       双多数派——因此变更前/中/后都不可能出现两个各自能推进提交的领导者，
+       也不可能出现“一部分认新表、一部分认旧表却各自提交”的分裂；
+    3. enter 提交后领导者自动追加 `leave-joint(C_new)`，再经双多数派提交，
+       集群切换到最终配置；新领导者在联合中间态接管时会自动续推
+       （必要时追加当前任期 no-op 以满足图 8 提交安全性）。
+  - 变更窗口内普通命令照常提交（双多数派），不停摆；新增 learner 已先追平，
+    联合阶段因此很短。
+  - 被移除节点在联合期间仍凭 C_old 身份参与双多数派，直到 leave-joint 提交；
+    领导者（含新当选接管者）会向其补发携带“leave 提交点”的最后心跳，
+    节点确认自己的移除已提交后才干净退出，随后可被摘除并在日后重新加入。
+  - 批量变更的**生效边界**（对每个被增/删节点，生效前 vs 生效后）：
+
+    | 身份阶段 | 能否投票 | 能否拉票参选 | 计提交多数派 |
+    | --- | --- | --- | --- |
+    | learner（已加入编排、未入表） | 否 | 否 | 不计 |
+    | 联合中间态且在 C_new 中（新加入者） | 是（仅新配置票） | 是（需双多数派） | 计入 C_new |
+    | 联合中间态且仅在 C_old 中（将被删者） | 是（仅旧配置票） | 是（需双多数派） | 计入 C_old |
+    | 联合中间态且同时在 C_old∩C_new | 是（两边票） | 是（需双多数派） | 两边均计 |
+    | leave 提交后留在 C_new | 是 | 是 | 按 C_new |
+    | leave 提交后被移出 | 否（确认提交后退出） | 否 | 不计 |
+
+  - **移除后重新加入**：同名节点以全新空日志、learner 身份重新加入编排，
+    旧持久状态被丢弃，完全由当前领导者经快照/日志补齐；其被移除期间的旧成员表、
+    旧日志不会影响集群判断，加入生效后正常参与复制与选举。
+  - 非法批量变更被显式拒绝：空批次（`bad-conf-change`）、同一节点重复增或
+    既增又删（`bad-conf-change`）、添加已在表成员/删除非成员（`unknown-voter`）、
+    删空整个集群（`bad-conf-change`）、learner 未追平（`learner-lagging`）。
   - 移除/降级节点不删除任何已提交数据：其历史保留在其余多数派成员中。
 
 ### 4. 确定性与可解释性
@@ -76,7 +106,8 @@
   与 `reason`（原因码），不同失败路径可区分，例如：
   `stale-term`、`already-voted`、`log-not-up-to-date`、`leader-lease`、
   `no-quorum`、`deposed`、`log-conflict`、`log-gap`、`membership-pending`、
-  `unknown-voter`、`snapshot-behind-commit`、`partitioned`、`dropped`、
+  `unknown-voter`、`not-voter`、`bad-conf-change`、`learner-lagging`、
+  `snapshot-behind-commit`、`partitioned`、`dropped`、
   `duplicate`、`shutdown`。
 
 ## 容错边界
@@ -88,7 +119,7 @@
 | 节点崩溃重启 | 持久状态（任期/投票/日志/快照）保留，FSM 从快照恢复，随后追平日志 |
 | 消息重复/乱序/丢包 | 幂等处理：重复确认不回退 matchIndex，重复应用无副作用；丢包靠心跳重传收敛 |
 | 日志严重落后 | 经快照恢复，提交位置不回退，恢复后继续按日志追赶 |
-| 成员增删 | 单节点变更串行生效；移除节点停止参与但不造成已提交数据丢失 |
+| 成员增删 | 单节点变更串行生效；批量变更经联合共识两阶段原子生效，双多数派保证全程不分裂；learner 先追平、窗口内普通命令不阻塞；移除节点干净退出后可重新加入，已提交数据不丢 |
 | 达到或超过半数节点同时失效 | **不可用**（无法形成多数派），这是多数派协议的固有边界，组件不会错误地允许少数派提交 |
 
 明确**不**覆盖：拜占庭故障（恶意/伪造消息）、跨集群地理位置时钟假设、
@@ -102,14 +133,14 @@
 # 1. 构建
 go build ./...
 
-# 2. 运行全部 20 个确定性场景测试
+# 2. 运行全部确定性场景测试（含批量变更、故障中途恢复、移除后再加入）
 go test -v ./...
 
-# 3. 运行六场景演示（打开详细判定日志可改 WithDebug(true)，demo 默认关闭 DEBUG）
+# 3. 运行七场景演示（打开详细判定日志可改 WithDebug(true)，demo 默认关闭 DEBUG）
 go run ./cmd/demo
 ```
 
-测试覆盖：
+测试覆盖（原有 20 个场景全部保留，另新增批量成员变更套件）：
 
 - `TestElectUniqueLeaderPerTerm`：同一任期唯一领导者；
 - `TestBasicReplicationAndApply` / `TestIdempotentApply`：按序幂等复制与应用；
@@ -122,7 +153,24 @@ go run ./cmd/demo
   `TestCompactRejectsUncommitted`：快照恢复与压缩安全；
 - `TestAddNodeThenCommit` / `TestRemoveNodeThenCommit` /
   `TestPendingConfChangeBlocks` / `TestRemoveUnknownVoterRejected`：
-  成员扩容、缩容、串行变更与非法变更拒绝；
+  **单节点**成员扩容、缩容、串行变更与非法变更拒绝（原有用法，继续兼容）；
+- `TestBatchAddTwoVoters` / `TestBatchRemoveTwoVoters` /
+  `TestBatchMixedAddAndRemove`：一次加两个、一次删两个、同批既加又删，
+  最终所有存活节点收敛到同一份成员表，learner 生效前后身份正确；
+- `TestBatchChangeDoesNotBlockCommands`：两阶段窗口内普通命令持续提交不卡停；
+- `TestBatchInvalidChangesRejected`：空批次/重复增/既增又删/删非成员/删空/
+  learner 未追平/变更重叠等非法输入的显式原因码拒绝；
+- `TestBatchLeaderCrashDuringJoint` / `TestBatchPartitionDuringJoint`：
+  联合窗口领导者崩溃或被隔离，恢复后变更安全完成或安全放弃，成员表收敛、
+  已提交数据不丢不回滚；
+- `TestRemoveThenReaddNode`：节点移除后以同名空日志重新加入，旧成员表/旧日志
+  不影响判断，重新加入后正常参与复制与选举；
+- `TestBatchAddLearnerRecoversViaSnapshot` /
+  `TestSnapshotDuringJointCommitted`：learner 经快照追平后批量加入、
+  联合落定后快照配置正确；
+- `TestBatchFuzzSeeds` / `TestBatchFuzzLeaderCrash` /
+  `TestBatchFuzzLeaderPartition`：在注入丢包/重复/乱序的多种子下反复执行
+  混合批量变更、联合窗口崩溃与分区，验证成员表收敛、命令序列一致、不丢数据；
 - `TestChaosMixedFailures`：5 节点上叠加周期性分区、崩溃重启与丢包/重复/乱序，
   恢复后逐条校验所有存活成员的已提交日志任期与状态机命令完全一致；
 - `TestDeterministic` / `TestDeterministicFaultRun`：相同种子两次运行结果（含故障统计）逐字节一致。
@@ -139,4 +187,35 @@ _ = c.Start(200)
 idx, reason := c.Propose("client", []byte("SET x=1"))
 _ = c.WaitCommit(idx, 200)
 c.Isolate("n1"); c.RunUntil(30); c.HealAll()
+```
+
+批量成员变更（一次增删多个节点；learner 追平、enter/leave-joint 由集群自动完成）：
+
+```go
+c := raft.NewCluster([]raft.NodeID{"n1", "n2", "n3"},
+    raft.WithSeed(42),
+    raft.WithLogWriter(os.Stdout))
+_ = c.Start(200)
+
+// 1) 新节点先加入编排（无投票权 learner），立即开始日志/快照追赶。
+_ = c.AddNode("n4")
+_ = c.AddNode("n5")
+
+// 2) 一次原子提交：同时加 n4/n5、删 n2（也支持只加或只删多个）。
+//    内部自动走 enter-joint(C_old,new) 与 leave-joint(C_new)，
+//    返回后变更已在全部存活节点落定并收敛到同一份成员表。
+idx, reason := c.ProposeBatchConfChange("client", raft.BatchConfChange{
+    Adds:    []raft.NodeID{"n4", "n5"},
+    Removes: []raft.NodeID{"n2"},
+})
+if reason != raft.ReasonOK {
+    log.Fatalf("批量变更失败: %s", reason)
+}
+_ = c.WaitMembershipConverged(
+    []raft.NodeID{"n1", "n3", "n4", "n5"}, 300)
+_ = c.WaitCommit(idx, 300)
+
+// 3) 节点级 API（不等集群自动完成时）可用：
+//    n.IsBatchConfComplete() 判断是否已离开联合中间态；
+//    n.Joint() 判断是否处于 C_old,new；NodeView{Learner,Joint} 观察身份。
 ```
