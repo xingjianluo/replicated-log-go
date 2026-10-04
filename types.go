@@ -53,6 +53,11 @@ type LogEntry struct {
 	Term    int
 	Kind    EntryKind
 	Payload []byte
+	// Internal 标记由集群内部自动追加的条目（如联合共识续推用的 no-op），
+	// 与客户端提交的条目严格区分：内部条目不进入状态机。
+	// 判别只能依据该标志，绝不能按 Payload 内容猜测——客户端命令
+	// 允许任意字节内容，包括与内部占位文本完全相同的内容。
+	Internal bool
 }
 
 // ConfChangeOp 是成员变更操作类型。

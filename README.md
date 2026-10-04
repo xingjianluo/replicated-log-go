@@ -16,7 +16,7 @@
 | `network.go` | 确定性网络：分区、延迟、丢包、重复、乱序注入与可区分的故障统计 |
 | `cluster.go` | 仿真编排：确定性 Tick 循环、消息分发、节点增删/重启、learner 注册、批量变更编排、观察视图 |
 | `cmd/demo/main.go` | 七个异常/运维场景的可运行演示 |
-| `*_test.go` | 20 个确定性场景测试 |
+| `*_test.go` | 确定性场景测试（选举/复制/分区/重启/快照/成员变更/内容语义） |
 
 ## 一致性协议要点
 
@@ -110,6 +110,24 @@
   `snapshot-behind-commit`、`partitioned`、`dropped`、
   `duplicate`、`shutdown`。
 
+### 5. 客户端命令内容语义（无保留字）
+
+- **命令正文没有保留字、没有禁止内容**：`Propose` 接受任意字节内容，
+  包括与内部占位文本（联合共识续推用的 no-op 负载 `"joint-noop"`）
+  完全相同的内容。客户端命令一律原样落盘、提交并应用到所有存活节点。
+- **内部条目与客户端数据严格隔离**：集群自动追加的内部条目
+  （联合续推 no-op）在落盘时以 `LogEntry.Internal` 标志标记，
+  应用阶段只凭该标志跳过、绝不进入状态机；判别从不依据负载内容，
+  因此内容相同的客户端命令不会被误当作内部条目吞掉，
+  内部条目也不会混进状态机污染客户端数据。
+- **“报告成功”的语义分两层**：`Propose` 返回成功仅表示条目已在领导者
+  **落盘**（并给出日志索引）；只有经多数派（联合期间为双多数派）**提交**
+  后才会按序应用到各节点状态机。`WaitCommit` 等待的正是“提交并应用”。
+  因此判定一条命令最终生效，应以提交后各存活节点状态机内容为准；
+  提交成功与状态机最终看到的内容严格对应，不会半途截断或回滚。
+- 提交失败/被拒均有可区分原因码（如 `not-leader`、`no-quorum`、
+  `membership-pending`、`shutdown`），与成功结果不会混淆。
+
 ## 容错边界
 
 | 故障 | 行为保证 |
@@ -140,7 +158,7 @@ go test -v ./...
 go run ./cmd/demo
 ```
 
-测试覆盖（原有 20 个场景全部保留，另新增批量成员变更套件）：
+测试覆盖（原有场景全部保留，另新增批量成员变更套件与命令内容语义套件）：
 
 - `TestElectUniqueLeaderPerTerm`：同一任期唯一领导者；
 - `TestBasicReplicationAndApply` / `TestIdempotentApply`：按序幂等复制与应用；
@@ -173,7 +191,18 @@ go run ./cmd/demo
   混合批量变更、联合窗口崩溃与分区，验证成员表收敛、命令序列一致、不丢数据；
 - `TestChaosMixedFailures`：5 节点上叠加周期性分区、崩溃重启与丢包/重复/乱序，
   恢复后逐条校验所有存活成员的已提交日志任期与状态机命令完全一致；
-- `TestDeterministic` / `TestDeterministicFaultRun`：相同种子两次运行结果（含故障统计）逐字节一致。
+- `TestDeterministic` / `TestDeterministicFaultRun`：相同种子两次运行结果（含故障统计）逐字节一致；
+- `TestClientCommandEqualToInternalNoopPayload`：客户端命令正文恰好等于内部
+  no-op 占位文本（`"joint-noop"`）时，仍被全部存活节点原样应用，
+  不出现“报告成功却查无此命令”；
+- `TestInternalNoopNeverReachesFSM`：联合窗口领导者崩溃触发内部 no-op 续推，
+  内部条目被所有节点跳过、不进状态机（断言日志中确实存在内部条目，
+  且状态机只有客户端命令）；
+- `TestNoopPayloadCommandSurvivesJointCrashAndRestart`：联合变更进行中提交
+  占位文本命令，随后领导者崩溃/重启、跟随者隔离/恢复，命令不丢不重，
+  最终与状态机内容严格对应；
+- `TestNoopPayloadCommandAcrossRemoveAndReadd`：节点移除前/移除后/重新加入后
+  各提交一条占位文本命令，三条都按序落到全部节点（含重新加入者）的状态机。
 
 在代码中自定义场景：
 
