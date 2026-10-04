@@ -1123,7 +1123,9 @@ func (n *Node) applyCommitted() {
 		if !ok {
 			break
 		}
-		if e.Kind == KindCommand && !isJointNoop(e) {
+		// 客户端命令（KindCommand）无论负载内容如何都必须原样进入 FSM；
+		// 内部空操作（KindNoop）与成员变更（KindConfChange）条目永远跳过。
+		if e.Kind == KindCommand {
 			if err := n.fsm.Apply(idx, e.Term, e.Payload); err != nil {
 				n.log.Warnf(string(n.id), n.Term(), n.quorum(), n.commitIndex,
 					ReasonRejectedByApplication, "应用 index=%d 失败: %v", idx, err)
@@ -1150,13 +1152,9 @@ func (n *Node) applyCommitted() {
 	n.observeSelfRemoved()
 }
 
-// jointNoopPayload 是领导者接管未完成联合变更时追加的内部空命令负载，
-// 仅用于以当前任期凑齐双多数派、连带提交旧任期的 enter/leave，不进入 FSM。
+// jointNoopPayload 是内部空操作条目的负载，仅用于日志可读性；
+// 是否跳过状态机完全由条目类型 KindNoop 决定，与负载内容无关。
 const jointNoopPayload = "joint-noop"
-
-func isJointNoop(e LogEntry) bool {
-	return e.Kind == KindCommand && string(e.Payload) == jointNoopPayload
-}
 
 // continueJointIfNeeded 由领导者调用，自动把联合共识推进到完成。它覆盖领导者
 // 在联合中间态可能遇到的全部接管形态：
@@ -1204,7 +1202,7 @@ func (n *Node) continueJointIfNeeded() []OutMsg {
 	if ok && lastEntry.Term == n.Term() {
 		return nil // 当前任期已有条目在途，等它拿到双多数派即可，不重复追加。
 	}
-	idx := n.st.AppendNew(n.Term(), LogEntry{Kind: KindCommand, Payload: []byte(jointNoopPayload)})
+	idx := n.st.AppendNew(n.Term(), LogEntry{Kind: KindNoop, Payload: []byte(jointNoopPayload)})
 	n.matchIndex[n.id] = idx
 	n.log.Infof(string(n.id), n.Term(), n.quorum(), n.commitIndex, ReasonOK,
 		"接管未完成的联合变更（旧任期配置条目 index=%d），追加当前任期 no-op index=%d 推动双多数派",

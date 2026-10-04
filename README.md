@@ -16,7 +16,7 @@
 | `network.go` | 确定性网络：分区、延迟、丢包、重复、乱序注入与可区分的故障统计 |
 | `cluster.go` | 仿真编排：确定性 Tick 循环、消息分发、节点增删/重启、learner 注册、批量变更编排、观察视图 |
 | `cmd/demo/main.go` | 七个异常/运维场景的可运行演示 |
-| `*_test.go` | 20 个确定性场景测试 |
+| `*_test.go` | 39 个确定性场景测试 |
 
 ## 一致性协议要点
 
@@ -49,6 +49,22 @@
   同索引不同内容报错），因此消息重复、领导者切换、节点重启都不会重复执行或回滚命令。
 - 客户端应答区分“已落盘”和“已提交”：提案返回仅表示领导者落盘，
   组件提供 `WaitCommit` 等待多数派提交并应用后再判定成功。
+
+### 2.1 客户端命令内容与内部条目
+
+- **客户端命令的负载内容没有任何保留字或禁止值**：任意字节内容（包括空串、
+  与内部占位文本完全相同的 `"joint-noop"`）都会被正常落盘、复制、提交，
+  并**原样**应用到所有存活节点的状态机。
+- 集群内部条目（成员变更 `KindConfChange`、联合共识续推用的空操作 `KindNoop`）
+  通过**条目类型**与客户端命令（`KindCommand`）区分，而不是通过负载内容：
+  内部条目照常复制与提交，但绝不进入状态机；客户端命令无论内容长什么样，
+  都一定进入状态机。两类流量互不污染。
+- “报告成功”的语义：`Propose` 返回 `ReasonOK` 表示条目已在领导者落盘并获得
+  索引；`WaitCommit(idx, ...)` 返回后，该索引及之前的全部条目已被多数派提交，
+  且每个存活成员的状态机都已应用到该位置——此后查询状态机必然能查到这条命令，
+  不存在“报告成功却查无此命令”的窗口。提交失败或被拒时返回可区分的原因码
+  （如 `not-leader`、`no-quorum`、`shutdown`、`membership-pending`），
+  成功与失败的结果与状态机最终内容一一对应，不会半途截断或回滚。
 
 ### 3. 日志压缩（快照）与成员变更兼容
 
@@ -133,14 +149,18 @@
 # 1. 构建
 go build ./...
 
-# 2. 运行全部确定性场景测试（含批量变更、故障中途恢复、移除后再加入）
+# 2. 运行全部确定性场景测试（含批量变更、故障中途恢复、移除后再加入、
+#    命令内容等于内部占位文本的回归用例；-v 日志可见各用例覆盖与通过情况）
 go test -v ./...
 
-# 3. 运行七场景演示（打开详细判定日志可改 WithDebug(true)，demo 默认关闭 DEBUG）
+# 3. 只跑“命令内容等于内部占位文本”的回归套件
+go test -v -run 'NoopPayload|InternalNoop|ClientCommandMatching' .
+
+# 4. 运行七场景演示（打开详细判定日志可改 WithDebug(true)，demo 默认关闭 DEBUG）
 go run ./cmd/demo
 ```
 
-测试覆盖（原有 20 个场景全部保留，另新增批量成员变更套件）：
+测试覆盖（原有场景全部保留，另新增批量成员变更套件与“命令内容等于内部占位文本”回归套件）：
 
 - `TestElectUniqueLeaderPerTerm`：同一任期唯一领导者；
 - `TestBasicReplicationAndApply` / `TestIdempotentApply`：按序幂等复制与应用；
@@ -173,6 +193,17 @@ go run ./cmd/demo
   混合批量变更、联合窗口崩溃与分区，验证成员表收敛、命令序列一致、不丢数据；
 - `TestChaosMixedFailures`：5 节点上叠加周期性分区、崩溃重启与丢包/重复/乱序，
   恢复后逐条校验所有存活成员的已提交日志任期与状态机命令完全一致；
+- `TestClientCommandMatchingInternalNoopPayload`：客户端命令内容恰好等于内部
+  空操作占位文本（`"joint-noop"`）时，仍作为普通命令落盘并应用到全部节点；
+- `TestInternalNoopEntriesStayOutOfFSM`：联合变更续推产生的内部 `KindNoop`
+  条目照常复制提交，但绝不进入任何节点的状态机；
+- `TestNoopPayloadCommandDuringJointLeaderCrash`：联合变更途中领导者崩溃，
+  新领导者以内部 no-op 续推的同时，客户端提交的占位文本命令不丢，
+  恢复后含重启节点在内的全部成员各应用一次；
+- `TestNoopPayloadCommandWithIsolationAndRestart`：占位文本命令在跟随者隔离、
+  节点崩溃重启叠加下不丢，愈合后三个节点状态机逐条一致；
+- `TestNoopPayloadCommandAfterRemoveReadd`：节点移除后再以同名重新加入，
+  新配置下占位文本命令在全部成员（含重新加入者）应用；
 - `TestDeterministic` / `TestDeterministicFaultRun`：相同种子两次运行结果（含故障统计）逐字节一致。
 
 在代码中自定义场景：

@@ -30,18 +30,24 @@ func (r Role) String() string {
 	}
 }
 
-// EntryKind 区分普通命令条目与成员变更条目。
+// EntryKind 区分普通命令条目、成员变更条目与内部空操作条目。
 type EntryKind uint8
 
 const (
 	KindCommand EntryKind = iota
 	KindConfChange
+	// KindNoop 是集群内部为推进联合共识而追加的空操作条目：
+	// 由协议自身产生、绝不进入状态机。它与客户端命令通过条目类型区分，
+	// 因此客户端命令的负载内容没有任何保留字或禁止值。
+	KindNoop
 )
 
 func (k EntryKind) String() string {
 	switch k {
 	case KindConfChange:
 		return "conf-change"
+	case KindNoop:
+		return "noop"
 	default:
 		return "command"
 	}
